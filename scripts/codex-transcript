@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Render a Codex rollout-*.jsonl session as a readable [TURN]/[AGENT] transcript.
+# Usage: codex-transcript.sh [rollout-file ...]   (defaults to ./rollout-*.jsonl)
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Render a Codex rollout-*.jsonl session as a readable [TURN]/[AGENT] transcript.
+
+Usage:
+  codex-transcript.sh [-w N | --width N] [rollout-file ...]
+  codex-transcript.sh -h | --help
+
+Options:
+  -w, --width N  Wrap prose at N columns (total line width, including the
+                 2-space indent). Default: 100. Does not affect code blocks
+                 or tables, which are emitted verbatim.
+
+Arguments:
+  rollout-file   One or more Codex rollout JSONL files. With none given,
+                 defaults to the glob rollout-*.jsonl in the current directory.
+                 Multiple files are concatenated into one transcript and the
+                 [TURN N] counter runs continuously across them.
+
+Output:
+  User prompts are labeled [TURN N], agent messages [AGENT]. The agent's own
+  line breaks, blank lines, and fenced code blocks are preserved; prose is
+  wrapped at the chosen width and list items get a hanging indent.
+EOF
+}
+
+width=100
+files=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)   usage; exit 0 ;;
+    -w|--width)  shift; width="${1:-}" ;;
+    --width=*)   width="${1#*=}" ;;
+    --)          shift; files+=("$@"); break ;;
+    -*)          echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)           files+=("$1") ;;
+  esac
+  shift
+done
+
+case "$width" in
+  ''|*[!0-9]*) echo "width must be a positive integer: '$width'" >&2; exit 2 ;;
+esac
+
+if [ ${#files[@]} -eq 0 ]; then
+  files=(rollout-*.jsonl)
+fi
+
+jq -r '
+  select(.type=="event_msg" and (.payload.type=="user_message" or .payload.type=="agent_message")) |
+  (if .payload.type=="user_message" then "@@@TURN@@@" else "@@@AGENT@@@" end), (.payload.message // "")
+' "${files[@]}" | awk -v width="$width" '
+  function rtrim(s){ sub(/[ \t]+$/,"",s); return s }
+  # A markdown table separator row: only |, :, - and whitespace, with a dash and a pipe.
+  function is_sep(s,   t){ t=s; gsub(/[ \t]/,"",t); return (t ~ /^[-:|]+$/ && t ~ /-/ && t ~ /\|/) }
+  function emit_line(line,   lead,m,hang,base,words,nw,i,cur) {
+    base="  "
+    if (line=="") { print ""; return }
+    lead=""; while (match(line,/^[ \t]/)) { lead=lead substr(line,1,1); line=substr(line,2) }
+    hang=""
+    if (match(line,/^([-*]|[0-9]+[.)])[ \t]+/)) { m=substr(line,RSTART,RLENGTH); hang=sprintf("%*s",length(m),"") }
+    nw=split(line,words," "); cur=""
+    for(i=1;i<=nw;i++){ word=words[i]
+      if(cur==""){ cur=word }
+      else if(length(base lead cur " " word) <= width){ cur=cur" "word }
+      else { print base lead cur; cur=word; lead=lead hang; hang="" }
+    }
+    if(cur!="") print base lead cur
+  }
+  # Render one buffered block (text between markers), with one-line lookahead.
+  function render_block(   i,incode){
+    incode=0
+    for(i=1;i<=nbuf;i++){
+      if (buf[i] ~ /^[ \t]*```/) { incode=!incode; print "  " rtrim(buf[i]); continue }
+      if (incode) { print "  " buf[i]; continue }
+      # Table: a pipe row immediately followed by a |---|---| separator.
+      if (buf[i] ~ /\|/ && i+1<=nbuf && is_sep(buf[i+1])) {
+        while (i<=nbuf && buf[i] ~ /\|/ && buf[i] !~ /^[ \t]*$/) { print "  " rtrim(buf[i]); i++ }
+        i--   # offset the for-loop increment
+        continue
+      }
+      emit_line(rtrim(buf[i]))
+    }
+    nbuf=0
+  }
+  BEGIN{ turn=0; nbuf=0 }
+  $0=="@@@TURN@@@"  { render_block(); turn++; printf "\n[TURN %d]\n", turn; next }
+  $0=="@@@AGENT@@@" { render_block(); printf "\n[AGENT]\n"; next }
+  { buf[++nbuf]=$0 }
+  END{ render_block() }
+'
